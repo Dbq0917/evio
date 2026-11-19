@@ -109,6 +109,22 @@ func (p *Poll) ModRead(fd int) {
 	}
 }
 
+// ModSuspendRead removes the read interest on fd while optionally keeping
+// the write interest. It is used to apply per-connection backpressure
+// without closing the socket. Level-triggered epoll re-reports any pending
+// data once ModRead re-arms the descriptor.
+func (p *Poll) ModSuspendRead(fd int, write bool) {
+	var events uint32
+	if write {
+		events = syscall.EPOLLOUT
+	}
+	if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_MOD, fd,
+		&syscall.EpollEvent{Fd: int32(fd), Events: events},
+	); err != nil {
+		panic(err)
+	}
+}
+
 // ModReadWrite ...
 func (p *Poll) ModReadWrite(fd int) {
 	if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_MOD, fd,

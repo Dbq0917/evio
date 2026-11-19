@@ -36,7 +36,28 @@ type Options struct {
 	// Default value is false, which means that all input data which is
 	// passed to the Data event will be a uniquely copied []byte slice.
 	ReuseInputBuffer bool
+	// AsyncData runs the Data event for each connection on a dedicated
+	// goroutine instead of directly inside the event loop. A slow Data
+	// callback on one connection therefore no longer blocks the other
+	// connections that share the same event loop. Within a single
+	// connection the Data events are still delivered in arrival order.
+	//
+	// Backpressure is applied per connection: at most MaxInflight packets
+	// may be in flight between the event loop and a connection worker.
+	// Once that limit is reached the connection stops reading from its
+	// socket until the worker catches up, so memory stays bounded and no
+	// extra buffering layer is introduced.
+	//
+	// Dispatch hands the exact byte slice the event loop already produced
+	// to the worker; it does not copy the packet a second time.
+	AsyncData bool
 }
+
+// MaxInflight is the maximum number of packets that may be queued between
+// the event loop and a single connection's Data worker while AsyncData is
+// enabled. Once a connection reaches this limit the event loop pauses
+// reading from that connection until the worker drains the queue.
+const MaxInflight = 300
 
 // Server represents a server context which provides information about the
 // running server and has control functions for managing state.

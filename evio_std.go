@@ -58,6 +58,30 @@ type stdconn struct {
 	lnidx      int         // index of listener
 	donein     []byte      // extra data for done connection
 	done       int32       // 0: attached, 1: closed, 2: detached
+
+	// AsyncData dispatch state. The reader goroutine owns the enqueue side
+	// of jobs; the loop owns everything else except the worker goroutine.
+	async   uint32        // atomic, set by the loop during accept
+	jobs    chan []byte   // reader -> worker packets (bounded)
+	results chan stdAsync // worker -> loop results (bounded)
+	wake    chan struct{} // coalesced synthetic wake notifications
+	stop    chan struct{} // closed when the connection is reaped
+	worker  chan struct{} // closed when the worker goroutine exits
+	reap    sync.Once     // guarantees a single teardown
+}
+
+// stdAsync is the outcome of one Data callback on a stdlib connection
+// worker. Slices are passed by reference without an extra copy.
+type stdAsync struct {
+	c      *stdconn
+	out    []byte
+	action Action
+	wake   bool
+}
+
+// stdAsyncWake tells the loop that a worker posted results to drain.
+type stdAsyncWake struct {
+	c *stdconn
 }
 
 type wakeReq struct {
@@ -215,7 +239,18 @@ func stdlistenerRun(s *stdserver, ln *listener, lnidx int) {
 						l.ch <- &stderr{c, err}
 						return
 					}
-					l.ch <- &stdin{c, append([]byte{}, packet[:n]...)}
+					in := append([]byte{}, packet[:n]...)
+					if atomic.LoadUint32(&c.async) == 1 {
+						// Bounded per-connection backpressure: a slow worker
+						// blocks only this connection's reader goroutine.
+						select {
+						case c.jobs <- in:
+						case <-c.stop:
+							return
+						}
+						continue
+					}
+					l.ch <- &stdin{c, in}
 				}
 			}(c)
 		}
@@ -276,6 +311,8 @@ func stdloopRun(s *stdserver, l *stdloop) {
 				err = stdloopError(s, l, v.c, v.err)
 			case wakeReq:
 				err = stdloopRead(s, l, v.c, nil)
+			case stdAsyncWake:
+				err = stdDrainAsync(s, l, v.c)
 			}
 		}
 		if err != nil {
@@ -306,6 +343,7 @@ loop:
 }
 
 func stdloopError(s *stdserver, l *stdloop, c *stdconn, err error) error {
+	stdAsyncReap(c)
 	delete(l.conns, c)
 	closeEvent := true
 	switch atomic.LoadInt32(&c.done) {
@@ -377,6 +415,14 @@ func stdloopRead(s *stdserver, l *stdloop, c *stdconn, in []byte) error {
 		c.donein = append(c.donein, in...)
 		return nil
 	}
+	if in == nil && atomic.LoadUint32(&c.async) == 1 {
+		// synthetic Wake on an asynchronous connection
+		select {
+		case c.wake <- struct{}{}:
+		default:
+		}
+		return nil
+	}
 	if s.events.Data != nil {
 		out, action := s.events.Data(c, in)
 		if len(out) > 0 {
@@ -397,6 +443,89 @@ func stdloopRead(s *stdserver, l *stdloop, c *stdconn, in []byte) error {
 	return nil
 }
 
+// stdAsyncWorker runs the Data callbacks for one connection in arrival
+// order. It never touches the socket; results return to the owning loop,
+// which keeps all writes and connection state single-threaded.
+func stdAsyncWorker(s *stdserver, l *stdloop, c *stdconn) {
+	defer close(c.worker)
+	for {
+		select {
+		case in, ok := <-c.jobs:
+			if !ok {
+				return
+			}
+			out, action := s.events.Data(c, in)
+			c.results <- stdAsync{c: c, out: out, action: action}
+			l.ch <- stdAsyncWake{c}
+		case <-c.wake:
+			out, action := s.events.Data(c, nil)
+			c.results <- stdAsync{c: c, out: out, action: action, wake: true}
+			l.ch <- stdAsyncWake{c}
+		case <-c.stop:
+			return
+		}
+	}
+}
+
+// stdDrainAsync applies all available worker results on the loop.
+func stdDrainAsync(s *stdserver, l *stdloop, c *stdconn) error {
+	if atomic.LoadInt32(&c.done) != 0 {
+		return nil
+	}
+	for {
+		select {
+		case res := <-c.results:
+			if err := stdApplyAsync(s, l, c, res); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+func stdApplyAsync(s *stdserver, l *stdloop, c *stdconn, res stdAsync) error {
+	if atomic.LoadInt32(&c.done) != 0 {
+		return nil
+	}
+	if len(res.out) > 0 {
+		if s.events.PreWrite != nil {
+			s.events.PreWrite()
+		}
+		c.conn.Write(res.out)
+	}
+	switch res.action {
+	case Shutdown:
+		return errClosing
+	case Detach:
+		return stdloopDetach(s, l, c)
+	case Close:
+		return stdloopClose(s, l, c)
+	}
+	return nil
+}
+
+// stdAsyncReap stops the worker and reader and reclaims queued results.
+// Closing stop unblocks a reader stuck on backpressure and a worker stuck
+// waiting to deliver a result; the loop drains the result channel so the
+// worker can actually finish.
+func stdAsyncReap(c *stdconn) {
+	if atomic.LoadUint32(&c.async) != 1 {
+		return
+	}
+	c.reap.Do(func() {
+		close(c.stop)
+		for {
+			select {
+			case <-c.results:
+			default:
+				<-c.worker
+				return
+			}
+		}
+	})
+}
+
 func stdloopReadUDP(s *stdserver, l *stdloop, c *stdudpconn) error {
 	if s.events.Data != nil {
 		out, action := s.events.Data(c, c.in)
@@ -415,12 +544,14 @@ func stdloopReadUDP(s *stdserver, l *stdloop, c *stdudpconn) error {
 }
 
 func stdloopDetach(s *stdserver, l *stdloop, c *stdconn) error {
+	stdAsyncReap(c)
 	atomic.StoreInt32(&c.done, 2)
 	c.conn.SetReadDeadline(time.Now())
 	return nil
 }
 
 func stdloopClose(s *stdserver, l *stdloop, c *stdconn) error {
+	stdAsyncReap(c)
 	atomic.StoreInt32(&c.done, 1)
 	c.conn.SetReadDeadline(time.Now())
 	return nil
@@ -439,6 +570,17 @@ func stdloopAccept(s *stdserver, l *stdloop, c *stdconn) error {
 				s.events.PreWrite()
 			}
 			c.conn.Write(out)
+		}
+		if opts.AsyncData && s.events.Data != nil {
+			c.jobs = make(chan []byte, MaxInflight)
+			c.results = make(chan stdAsync, MaxInflight)
+			c.wake = make(chan struct{}, 1)
+			c.stop = make(chan struct{})
+			c.worker = make(chan struct{})
+			go stdAsyncWorker(s, l, c)
+			// Publish only after the channels exist; the reader observes
+			// this atomic before enqueueing its first packet.
+			atomic.StoreUint32(&c.async, 1)
 		}
 		if opts.TCPKeepAlive > 0 {
 			if c, ok := c.conn.(*net.TCPConn); ok {

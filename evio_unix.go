@@ -33,6 +33,29 @@ type conn struct {
 	localAddr  net.Addr         // local addre
 	remoteAddr net.Addr         // remote addr
 	loop       *loop            // connected loop
+
+	// AsyncData dispatch state. All fields below are owned by the event
+	// loop except inside the worker goroutine, which only touches the
+	// channels it received when it was started.
+	async    bool             // Data runs on a dedicated worker
+	jobs     chan []byte      // event loop -> worker packets (bounded)
+	results  chan asyncResult // worker -> event loop results (bounded)
+	wake     chan struct{}    // coalesced synthetic wake notifications
+	inflight int              // packets handed to the worker, not done
+	paused   bool             // reading paused because the job queue is full
+	closing  bool             // event loop asked the worker to exit
+	closed   bool             // worker has exited and reaped its result
+	done     chan struct{}    // closed when the worker goroutine exits
+}
+
+// asyncResult is the outcome of a single Data callback executed on a
+// connection worker. It carries references to the exact slices returned by
+// the callback; the dispatch path never copies the packet or the reply.
+type asyncResult struct {
+	c      *conn
+	out    []byte
+	action Action
+	wake   bool // synthetic wake event, in is nil
 }
 
 func (c *conn) Context() interface{}       { return c.ctx }
@@ -65,6 +88,12 @@ type loop struct {
 	packet  []byte         // read packet buffer
 	fdconns map[int]*conn  // loop connections fd -> conn
 	count   int32          // connection count
+}
+
+// asyncWake is the note delivered to a loop when one of its connection
+// workers has posted at least one result that needs draining.
+type asyncWake struct {
+	c *conn
 }
 
 // waitForShutdown waits for a signal to shutdown
@@ -159,6 +188,13 @@ func serve(events Events, listeners []*listener) error {
 }
 
 func loopCloseConn(s *server, l *loop, c *conn, err error) error {
+	if c.async {
+		// Stop the worker and reclaim every result it still owed us. The
+		// worker cannot exit while a result is pending on the bounded
+		// channel, so this loop must drain here; otherwise a slow callback
+		// on a closing connection would leak a goroutine forever.
+		loopAsyncReap(s, l, c)
+	}
 	atomic.AddInt32(&l.count, -1)
 	delete(l.fdconns, c.fd)
 	syscall.Close(c.fd)
@@ -175,6 +211,9 @@ func loopCloseConn(s *server, l *loop, c *conn, err error) error {
 func loopDetachConn(s *server, l *loop, c *conn, err error) error {
 	if s.events.Detached == nil {
 		return loopCloseConn(s, l, c, err)
+	}
+	if c.async {
+		loopAsyncReap(s, l, c)
 	}
 	l.poll.ModDetach(c.fd)
 
@@ -209,7 +248,12 @@ func loopNote(s *server, l *loop, note interface{}) error {
 		if l.fdconns[v.fd] != v {
 			return nil // ignore stale wakes
 		}
+		if v.async {
+			return loopAsyncWake(s, l, v)
+		}
 		return loopWake(s, l, v)
+	case asyncWake:
+		return loopDrainConn(s, l, v.c)
 	}
 	return err
 }
@@ -354,6 +398,24 @@ func loopOpened(s *server, l *loop, c *conn) error {
 		}
 		c.action = action
 		c.reuse = opts.ReuseInputBuffer
+		if opts.AsyncData {
+			if s.events.Data == nil {
+				// Nothing to dispatch; keep the synchronous path.
+			} else {
+				c.async = true
+				// ReuseInputBuffer hands the shared read packet straight to
+				// the callback. A worker would read that packet's contents
+				// after the next socket read overwrote it, so asynchronous
+				// dispatch always needs the per-packet copy (which is already
+				// the default) and never adds a copy of its own.
+				c.reuse = false
+				c.jobs = make(chan []byte, MaxInflight)
+				c.results = make(chan asyncResult, MaxInflight)
+				c.wake = make(chan struct{}, 1)
+				c.done = make(chan struct{})
+				go loopAsyncWorker(s, l, c)
+			}
+		}
 		if opts.TCPKeepAlive > 0 {
 			if _, ok := s.lns[c.lnidx].ln.(*net.TCPListener); ok {
 				internal.SetKeepAlive(c.fd, int(opts.TCPKeepAlive/time.Second))
@@ -389,7 +451,7 @@ func loopWrite(s *server, l *loop, c *conn) error {
 		c.out = c.out[n:]
 	}
 	if len(c.out) == 0 && c.action == None {
-		l.poll.ModRead(c.fd)
+		loopArmRead(l, c)
 	}
 	return nil
 }
@@ -406,9 +468,19 @@ func loopAction(s *server, l *loop, c *conn) error {
 		return loopDetachConn(s, l, c, nil)
 	}
 	if len(c.out) == 0 && c.action == None {
-		l.poll.ModRead(c.fd)
+		loopArmRead(l, c)
 	}
 	return nil
+}
+
+// loopArmRead re-arms a connection for reading unless backpressure has the
+// connection paused, in which case the worker's resume event re-arms it.
+func loopArmRead(l *loop, c *conn) {
+	if c.paused {
+		l.poll.ModSuspendRead(c.fd, len(c.out) > 0 || c.action != None)
+		return
+	}
+	l.poll.ModRead(c.fd)
 }
 
 func loopWake(s *server, l *loop, c *conn) error {
@@ -427,6 +499,9 @@ func loopWake(s *server, l *loop, c *conn) error {
 }
 
 func loopRead(s *server, l *loop, c *conn) error {
+	if c.async {
+		return loopReadAsync(s, l, c)
+	}
 	var in []byte
 	n, err := syscall.Read(c.fd, l.packet)
 	if n == 0 || err != nil {
@@ -450,6 +525,140 @@ func loopRead(s *server, l *loop, c *conn) error {
 		l.poll.ModReadWrite(c.fd)
 	}
 	return nil
+}
+
+// loopAsyncWorker is the per-connection Data callback goroutine. It drains
+// the bounded job queue in arrival order, so the ordering guarantee of a
+// single TCP connection is preserved even while other connections keep being
+// served by the event loop. The worker never touches the socket or any
+// connection write state; every result is handed back to the owning loop.
+func loopAsyncWorker(s *server, l *loop, c *conn) {
+	defer close(c.done)
+	for {
+		select {
+		case in, ok := <-c.jobs:
+			if !ok {
+				return
+			}
+			out, action := s.events.Data(c, in)
+			c.results <- asyncResult{c: c, out: out, action: action}
+			l.poll.Trigger(asyncWake{c})
+		case <-c.wake:
+			out, action := s.events.Data(c, nil)
+			c.results <- asyncResult{c: c, out: out, action: action, wake: true}
+			l.poll.Trigger(asyncWake{c})
+		}
+	}
+}
+
+// loopReadAsync enqueues a freshly read packet to the connection worker.
+// At most MaxInflight packets per connection are in flight; once the limit
+// is hit reading on that fd is suspended while every other fd keeps being
+// dispatched. The byte slice produced by the normal copy-on-read path is
+// handed over as-is, so the dispatch adds no second copy.
+func loopReadAsync(s *server, l *loop, c *conn) error {
+	if c.inflight >= MaxInflight {
+		c.paused = true
+		l.poll.ModSuspendRead(c.fd, len(c.out) > 0 || c.action != None)
+		return nil
+	}
+	n, err := syscall.Read(c.fd, l.packet)
+	if n == 0 || err != nil {
+		if err == syscall.EAGAIN {
+			return nil
+		}
+		return loopCloseConn(s, l, c, err)
+	}
+	in := append([]byte{}, l.packet[:n]...)
+	c.inflight++
+	// len(jobs) <= inflight < MaxInflight == cap(jobs), so this send has a
+	// free slot and never stalls the event loop.
+	c.jobs <- in
+	return nil
+}
+
+// loopAsyncWake schedules a synthetic nil Data event on the worker. Wake
+// notifications are coalesced and do not consume an in-flight slot.
+func loopAsyncWake(s *server, l *loop, c *conn) error {
+	if s.events.Data == nil || c.closing {
+		return nil
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// loopDrainConn applies every result a worker has posted for c, in the
+// order the callbacks completed. It runs on the owning event loop, which is
+// the only goroutine allowed to mutate the connection and its write buffer.
+func loopDrainConn(s *server, l *loop, c *conn) error {
+	if l.fdconns[c.fd] != c || c.closed {
+		return nil // stale wake after close/reap
+	}
+	for {
+		select {
+		case res := <-c.results:
+			if err := loopApplyAsyncResult(s, l, c, res); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+func loopApplyAsyncResult(s *server, l *loop, c *conn, res asyncResult) error {
+	if c.closing {
+		return nil
+	}
+	if !res.wake {
+		c.inflight--
+	}
+	if len(res.out) > 0 {
+		c.out = append(c.out[:0], res.out...)
+	}
+	c.action = res.action
+	switch res.action {
+	case Close:
+		return loopCloseConn(s, l, c, nil)
+	case Shutdown:
+		return errClosing
+	case Detach:
+		return loopDetachConn(s, l, c, nil)
+	}
+	if c.paused && c.inflight < MaxInflight {
+		// A slot freed up; re-arm reading on this single connection.
+		c.paused = false
+		loopArmRead(l, c)
+	} else if len(c.out) != 0 || c.action != None {
+		l.poll.ModReadWrite(c.fd)
+	}
+	return nil
+}
+
+// loopAsyncReap stops the worker and drains every result it still owed.
+// The worker cannot exit while a result is pending on the bounded channel,
+// so a closing/detaching connection must drain here or leak the goroutine.
+func loopAsyncReap(s *server, l *loop, c *conn) {
+	if c.closed {
+		return
+	}
+	c.closing = true
+	close(c.jobs)
+	for {
+		select {
+		case res := <-c.results:
+			if !res.wake && c.inflight > 0 {
+				c.inflight--
+			}
+		default:
+			<-c.done
+			c.closed = true
+			return
+		}
+	}
 }
 
 type detachedConn struct {

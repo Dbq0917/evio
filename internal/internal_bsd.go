@@ -103,6 +103,23 @@ func (p *Poll) ModRead(fd int) {
 	p.changes = append(p.changes, syscall.Kevent_t{
 		Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_WRITE,
 	})
+	p.changes = append(p.changes, syscall.Kevent_t{
+		Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_READ,
+	})
+}
+
+// ModSuspendRead removes the read interest on fd while optionally keeping
+// the write interest. It is used to apply per-connection backpressure
+// without closing the socket.
+func (p *Poll) ModSuspendRead(fd int, write bool) {
+	p.changes = append(p.changes, syscall.Kevent_t{
+		Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_READ,
+	})
+	if write {
+		p.changes = append(p.changes, syscall.Kevent_t{
+			Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_WRITE,
+		})
+	}
 }
 
 // ModReadWrite ...
