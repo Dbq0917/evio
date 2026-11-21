@@ -20,6 +20,7 @@ func main() {
 	var trace bool
 	var reuseport bool
 	var stdlib bool
+	var maxout int
 
 	flag.IntVar(&port, "port", 5000, "server port")
 	flag.BoolVar(&udp, "udp", false, "listen on udp")
@@ -27,6 +28,7 @@ func main() {
 	flag.BoolVar(&trace, "trace", false, "print packets to console")
 	flag.IntVar(&loops, "loops", 0, "num loops")
 	flag.BoolVar(&stdlib, "stdlib", false, "use stdlib")
+	flag.IntVar(&maxout, "maxout", 0, "max write buffer size per connection in bytes (0 = unlimited)")
 	flag.Parse()
 
 	var events evio.Events
@@ -39,6 +41,14 @@ func main() {
 		if stdlib {
 			log.Printf("stdlib")
 		}
+		return
+	}
+	events.Opened = func(c evio.Conn) (out []byte, opts evio.Options, action evio.Action) {
+		opts.MaxWriteBufferSize = maxout
+		return
+	}
+	events.WriteBufferFull = func(c evio.Conn) (action evio.Action) {
+		log.Printf("write buffer full for %s, throttling reads", c.RemoteAddr())
 		return
 	}
 	events.Data = func(c evio.Conn, in []byte) (out []byte, action evio.Action) {

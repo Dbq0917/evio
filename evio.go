@@ -36,6 +36,17 @@ type Options struct {
 	// Default value is false, which means that all input data which is
 	// passed to the Data event will be a uniquely copied []byte slice.
 	ReuseInputBuffer bool
+	// MaxWriteBufferSize is the maximum number of bytes that the
+	// connection write buffer is allowed to hold before backpressure is
+	// applied. When the buffer reaches this limit, the connection stops
+	// reading new data from the peer (allowing TCP flow control to
+	// throttle the sender) and the WriteBufferFull event fires. The
+	// connection is not closed and reading automatically resumes once
+	// the buffer has drained below half of the limit.
+	// A value of 0 (the default) means no limit.
+	// This option is ignored by stdlib ("-net") servers, where outgoing
+	// data is written synchronously and never buffered.
+	MaxWriteBufferSize int
 }
 
 // Server represents a server context which provides information about the
@@ -115,6 +126,13 @@ type Events struct {
 	Detached func(c Conn, rwc io.ReadWriteCloser) (action Action)
 	// PreWrite fires just before any data is written to any client socket.
 	PreWrite func()
+	// WriteBufferFull fires when a connection write buffer reaches the
+	// MaxWriteBufferSize limit set in Options. It fires once each time
+	// the limit is crossed and the connection remains open; reads from
+	// the peer are suspended until the buffer drains.
+	// Return Close to close the connection instead, or Shutdown to
+	// shutdown the server.
+	WriteBufferFull func(c Conn) (action Action)
 	// Data fires when a connection sends the server data.
 	// The in parameter is the incoming data.
 	// Use the out return value to write data to the connection.

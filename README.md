@@ -76,6 +76,7 @@ The event type has a bunch of handy events:
 - `Opened` fires when a connection has opened.
 - `Closed` fires when a connection has closed.
 - `Detach` fires when a connection has been detached using the `Detach` return action.
+- `WriteBufferFull` fires when a connection write buffer reaches the `MaxWriteBufferSize` limit set in `Options`. The connection stays open and reads from the peer are suspended until the buffer drains below half the limit.
 - `Data` fires when the server receives new data from a connection.
 - `Tick` fires immediately after the server starts and will fire again after a specified interval.
 

@@ -24,6 +24,8 @@ type conn struct {
 	fd         int              // file descriptor
 	lnidx      int              // listener index in the server lns list
 	out        []byte           // write buffer
+	maxOut     int              // write buffer limit, 0 means no limit
+	throttled  bool             // write buffer full, reads suspended
 	sa         syscall.Sockaddr // remote socket address
 	reuse      bool             // should reuse input buffer
 	opened     bool             // connection opened event fired
@@ -55,6 +57,8 @@ type server struct {
 	balance  LoadBalance        // load balancing method
 	accepted uintptr            // accept counter
 	tch      chan time.Duration // ticker channel
+	tkill    chan bool          // ticker shutdown signal
+	tdone    chan bool          // ticker stopped signal
 
 	//ticktm   time.Time      // next tick time
 }
@@ -98,6 +102,8 @@ func serve(events Events, listeners []*listener) error {
 	s.cond = sync.NewCond(&sync.Mutex{})
 	s.balance = events.LoadBalance
 	s.tch = make(chan time.Duration)
+	s.tkill = make(chan bool)
+	s.tdone = make(chan bool)
 
 	//println("-- server starting")
 	if s.events.Serving != nil {
@@ -118,6 +124,13 @@ func serve(events Events, listeners []*listener) error {
 	defer func() {
 		// wait on a signal for shutdown
 		s.waitForShutdown()
+
+		// stop the ticker before closing the loops so that it cannot
+		// write to a closed wake fd, which may have been reused.
+		if s.events.Tick != nil {
+			close(s.tkill)
+			<-s.tdone
+		}
 
 		// notify all loops to close by closing all listeners
 		for _, l := range s.loops {
@@ -201,7 +214,10 @@ func loopNote(s *server, l *loop, note interface{}) error {
 		case Shutdown:
 			err = errClosing
 		}
-		s.tch <- delay
+		select {
+		case s.tch <- delay:
+		case <-s.tkill:
+		}
 	case error: // shutdown
 		err = v
 	case *conn:
@@ -247,11 +263,23 @@ func loopRun(s *server, l *loop) {
 }
 
 func loopTicker(s *server, l *loop) {
+	defer close(s.tdone)
 	for {
 		if err := l.poll.Trigger(time.Duration(0)); err != nil {
-			break
+			return
 		}
-		time.Sleep(<-s.tch)
+		select {
+		case delay := <-s.tch:
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-s.tkill:
+				timer.Stop()
+				return
+			}
+		case <-s.tkill:
+			return
+		}
 	}
 }
 
@@ -354,6 +382,7 @@ func loopOpened(s *server, l *loop, c *conn) error {
 		}
 		c.action = action
 		c.reuse = opts.ReuseInputBuffer
+		c.maxOut = opts.MaxWriteBufferSize
 		if opts.TCPKeepAlive > 0 {
 			if _, ok := s.lns[c.lnidx].ln.(*net.TCPListener); ok {
 				internal.SetKeepAlive(c.fd, int(opts.TCPKeepAlive/time.Second))
@@ -362,8 +391,36 @@ func loopOpened(s *server, l *loop, c *conn) error {
 	}
 	if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
+	} else if _, err := loopThrottle(s, l, c); err != nil {
+		return err
 	}
 	return nil
+}
+
+// loopThrottle applies backpressure when the connection write buffer
+// reaches its limit: reads from the peer are suspended and the
+// WriteBufferFull event fires once, giving the application a chance to
+// react. The connection is kept open unless the event asks otherwise.
+// It returns true when the connection is currently throttled.
+func loopThrottle(s *server, l *loop, c *conn) (bool, error) {
+	if c.maxOut <= 0 || len(c.out) < c.maxOut {
+		return false, nil
+	}
+	if c.throttled {
+		return true, nil
+	}
+	c.throttled = true
+	l.poll.ModWrite(c.fd)
+	if s.events.WriteBufferFull != nil {
+		switch s.events.WriteBufferFull(c) {
+		case None:
+		case Close:
+			return true, loopCloseConn(s, l, c, nil)
+		case Shutdown:
+			return true, errClosing
+		}
+	}
+	return true, nil
 }
 
 func loopWrite(s *server, l *loop, c *conn) error {
@@ -388,7 +445,17 @@ func loopWrite(s *server, l *loop, c *conn) error {
 	} else {
 		c.out = c.out[n:]
 	}
-	if len(c.out) == 0 && c.action == None {
+	if c.throttled {
+		if len(c.out) <= c.maxOut/2 {
+			// the buffer drained below the low watermark, resume reads
+			c.throttled = false
+			if len(c.out) == 0 && c.action == None {
+				l.poll.ModRead(c.fd)
+			} else {
+				l.poll.ModReadWrite(c.fd)
+			}
+		}
+	} else if len(c.out) == 0 && c.action == None {
 		l.poll.ModRead(c.fd)
 	}
 	return nil
@@ -418,10 +485,14 @@ func loopWake(s *server, l *loop, c *conn) error {
 	out, action := s.events.Data(c, nil)
 	c.action = action
 	if len(out) > 0 {
-		c.out = append([]byte{}, out...)
+		c.out = append(c.out, out...)
 	}
 	if len(c.out) != 0 || c.action != None {
-		l.poll.ModReadWrite(c.fd)
+		if throttled, err := loopThrottle(s, l, c); err != nil {
+			return err
+		} else if !throttled {
+			l.poll.ModReadWrite(c.fd)
+		}
 	}
 	return nil
 }
@@ -447,7 +518,11 @@ func loopRead(s *server, l *loop, c *conn) error {
 		}
 	}
 	if len(c.out) != 0 || c.action != None {
-		l.poll.ModReadWrite(c.fd)
+		if throttled, err := loopThrottle(s, l, c); err != nil {
+			return err
+		} else if !throttled {
+			l.poll.ModReadWrite(c.fd)
+		}
 	}
 	return nil
 }

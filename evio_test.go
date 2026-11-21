@@ -183,6 +183,90 @@ func must(err error) {
 		panic(err)
 	}
 }
+
+func TestWriteBufferBackpressure(t *testing.T) {
+	// A fast-writing, slow-reading client must not grow the server
+	// write buffer without bounds. The server should throttle reads,
+	// fire WriteBufferFull, keep the connection open, and deliver all
+	// echoed data intact once the client starts reading.
+	const maxOut = 32 * 1024
+	const total = 4 * 1024 * 1024
+	var fulls int32
+	var closeErr int32
+	done := make(chan bool)
+	var events Events
+	events.NumLoops = 1
+	events.Opened = func(c Conn) (out []byte, opts Options, action Action) {
+		opts.MaxWriteBufferSize = maxOut
+		return
+	}
+	events.WriteBufferFull = func(c Conn) (action Action) {
+		atomic.AddInt32(&fulls, 1)
+		return
+	}
+	events.Closed = func(c Conn, err error) (action Action) {
+		if err != nil {
+			atomic.StoreInt32(&closeErr, 1)
+		}
+		return Shutdown
+	}
+	events.Data = func(c Conn, in []byte) (out []byte, action Action) {
+		out = in
+		return
+	}
+	go func() {
+		must(Serve(events, "tcp://:9881"))
+		close(done)
+	}()
+	time.Sleep(time.Millisecond * 100)
+
+	c, err := net.Dial("tcp", ":9881")
+	must(err)
+	// flood the server without reading anything back
+	werr := make(chan error)
+	go func() {
+		chunk := make([]byte, 32*1024)
+		var sent int
+		for sent < total {
+			for i := range chunk {
+				chunk[i] = byte(sent + i)
+			}
+			n, err := c.Write(chunk)
+			sent += n
+			if err != nil {
+				werr <- err
+				return
+			}
+		}
+		werr <- nil
+	}()
+	// give the server time to fill its write buffer and throttle
+	time.Sleep(time.Millisecond * 500)
+	// now slowly read back and verify every echoed byte
+	buf := make([]byte, 32*1024)
+	var read int
+	for read < total {
+		n, err := c.Read(buf)
+		must(err)
+		for i := 0; i < n; i++ {
+			if buf[i] != byte(read+i) {
+				t.Fatalf("echo mismatch at byte %d", read+i)
+			}
+		}
+		read += n
+		time.Sleep(time.Millisecond)
+	}
+	must(<-werr)
+	must(c.Close())
+	<-done
+	if atomic.LoadInt32(&fulls) == 0 {
+		t.Fatal("WriteBufferFull event never fired")
+	}
+	if atomic.LoadInt32(&closeErr) != 0 {
+		t.Fatal("slow connection was closed with an error")
+	}
+}
+
 func TestTick(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)

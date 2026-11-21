@@ -109,6 +109,17 @@ func (p *Poll) ModRead(fd int) {
 	}
 }
 
+// ModWrite ...
+func (p *Poll) ModWrite(fd int) {
+	if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_MOD, fd,
+		&syscall.EpollEvent{Fd: int32(fd),
+			Events: syscall.EPOLLOUT,
+		},
+	); err != nil {
+		panic(err)
+	}
+}
+
 // ModReadWrite ...
 func (p *Poll) ModReadWrite(fd int) {
 	if err := syscall.EpollCtl(p.fd, syscall.EPOLL_CTL_MOD, fd,

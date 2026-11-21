@@ -105,11 +105,23 @@ func (p *Poll) ModRead(fd int) {
 	})
 }
 
+// ModWrite ...
+func (p *Poll) ModWrite(fd int) {
+	p.changes = append(p.changes, syscall.Kevent_t{
+		Ident: uint64(fd), Flags: syscall.EV_DELETE, Filter: syscall.EVFILT_READ,
+	})
+}
+
 // ModReadWrite ...
 func (p *Poll) ModReadWrite(fd int) {
-	p.changes = append(p.changes, syscall.Kevent_t{
-		Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_WRITE,
-	})
+	p.changes = append(p.changes,
+		syscall.Kevent_t{
+			Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_READ,
+		},
+		syscall.Kevent_t{
+			Ident: uint64(fd), Flags: syscall.EV_ADD, Filter: syscall.EVFILT_WRITE,
+		},
+	)
 }
 
 // ModDetach ...
