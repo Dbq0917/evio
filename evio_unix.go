@@ -270,11 +270,15 @@ func loopAccept(s *server, l *loop, fd int) error {
 						}
 					}
 				case RoundRobin:
-					idx := int(atomic.LoadUintptr(&s.accepted)) % len(s.loops)
+					// Claim the next connection slot atomically. Every loop
+					// shares this counter, so a load-then-increment would let
+					// several loops observe the same half-updated value and
+					// route connections to the wrong loop. Add-first hands
+					// each woken loop a unique, contiguous slot with no lock.
+					idx := int(atomic.AddUintptr(&s.accepted, 1)-1) % len(s.loops)
 					if idx != l.idx {
 						return nil // do not accept
 					}
-					atomic.AddUintptr(&s.accepted, 1)
 				}
 			}
 			if ln.pconn != nil {
