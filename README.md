@@ -100,6 +100,46 @@ events.Tick = func() (delay time.Duration, action Action){
 }
 ```
 
+## Framed messages
+
+The `Data` event delivers whatever bytes are currently available in the
+socket read buffer, so a single message may be split across several events
+(messages larger than the 64KB read packet always are). Applications that
+need one callback per complete message can use `FrameBuffer`.
+
+Each wire frame is a 4-byte big-endian payload length followed by the
+payload. Create one `FrameBuffer` per connection and feed it every `Data`
+packet; it returns whole frames and keeps partial frames buffered until the
+remaining bytes arrive.
+
+```go
+events.Opened = func(c evio.Conn) (out []byte, opts evio.Options, action evio.Action) {
+    c.SetContext(&evio.FrameBuffer{MaxPacketSize: 8 * 1024 * 1024})
+    return
+}
+events.Data = func(c evio.Conn, in []byte) (out []byte, action evio.Action) {
+    fb := c.Context().(*evio.FrameBuffer)
+    frames, err := fb.Read(in)
+    if err == evio.ErrFrameTooLarge {
+        return nil, evio.Close
+    }
+    for _, frame := range frames {
+        // frame is one complete message
+        out = evio.AppendFrame(out, frame) // echo it back, framed
+    }
+    return
+}
+```
+
+- `MaxPacketSize` caps a single frame; an oversized frame returns
+  `ErrFrameTooLarge` instead of letting the buffer grow without bound.
+- Small messages that fit inside one packet are delivered with no extra copy,
+  so their latency is unchanged.
+- When `Options.ReuseInputBuffer` is enabled, set the matching
+  `FrameBuffer.VolatileInput` field so carried-over bytes are copied out of
+  the shared read buffer.
+- Use `AppendFrame` on the client side to write frames in the same format.
+
 ## UDP
 
 The `Serve` function can bind to UDP addresses. 
